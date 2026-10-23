@@ -27,6 +27,12 @@
 
 #define QUEUE_DEFAULT_MAX 100000
 
+/* backoff of the network thread when mosquitto_loop_forever gives up */
+#define RECONNECT_DELAY_MIN 1     /* seconds */
+#define RECONNECT_DELAY_MAX 60
+/* backoff of the reconnects libmosquitto does on its own inside the loop */
+#define LOOP_RECONNECT_DELAY_MAX 30
+
 /* ---- configuration ---------------------------------------------------- */
 
 struct pl_mqtt_conf {
@@ -221,6 +227,10 @@ struct pl_mqtt_client {
   int connack_rc;
   int started;              /* network thread running */
   int connect_called;
+  int want_connected;       /* cleared by pl_mqtt_disconnect: no automatic reconnect */
+  int stopping;             /* set by pl_mqtt_client_destroy: the network thread exits */
+  unsigned long connects;   /* successful CONNACKs, resets the reconnect backoff */
+  pthread_t thread;
 
   qnode *head, *tail;
   int queued;
@@ -274,6 +284,9 @@ static void cb_connect(struct mosquitto *mosq, void *obj, int rc)
   c->connack_rc = rc;
   c->connected = (rc == 0);
   if (rc == 0) {
+    if (c->connects++ > 0) {
+      fprintf(stderr, "pl_mqtt: reconnected to %s:%d\n", c->conf->host, c->conf->port);
+    }
     /* (re-)establish remembered subscriptions, e.g. after a reconnect */
     for (sub *s = c->subs; s; s = s->next) {
       mosquitto_subscribe(mosq, NULL, s->pattern, s->qos);
@@ -285,8 +298,13 @@ static void cb_connect(struct mosquitto *mosq, void *obj, int rc)
 
 static void cb_disconnect(struct mosquitto *mosq, void *obj, int rc)
 {
-  (void)mosq; (void)rc;
+  (void)mosq;
   pl_mqtt_client *c = obj;
+  /* rc == 0 only after mosquitto_disconnect, anything else is a lost connection */
+  if (rc != 0) {
+    fprintf(stderr, "pl_mqtt: connection to %s:%d lost (%s)\n",
+            c->conf->host, c->conf->port, mosquitto_strerror(rc));
+  }
   pthread_mutex_lock(&c->lock);
   c->connected = 0;
   pthread_cond_broadcast(&c->cond);
@@ -344,6 +362,63 @@ static void deadline_in(struct timespec *ts, int timeout_ms)
   if (ts->tv_nsec >= 1000000000L) { ts->tv_sec++; ts->tv_nsec -= 1000000000L; }
 }
 
+/* the network thread. mosquitto_loop_forever reconnects by itself after
+ * most errors, but returns for good after others (e.g. MOSQ_ERR_TLS on a
+ * broken TLS stream, MOSQ_ERR_EAI from a failed DNS lookup). with
+ * mosquitto_loop_start that ended the thread silently: no more keepalive
+ * pings, no reconnect, mqtt_poll timing out forever. here the loop is
+ * restarted with a backoff until the client is destroyed; it only idles
+ * after an explicit pl_mqtt_disconnect. */
+static void *network_thread(void *arg)
+{
+  pl_mqtt_client *c = arg;
+  int delay = RECONNECT_DELAY_MIN;
+  unsigned long seen = 0;
+
+  for (;;) {
+    int rc = mosquitto_loop_forever(c->mosq, 1000, 1);
+
+    pthread_mutex_lock(&c->lock);
+    c->connected = 0;
+    if (c->connects != seen) { seen = c->connects; delay = RECONNECT_DELAY_MIN; }
+    int idled = 0;
+    while (!c->stopping && !c->want_connected) {
+      idled = 1;
+      pthread_cond_wait(&c->cond, &c->lock);
+    }
+    int stop = c->stopping;
+    pthread_mutex_unlock(&c->lock);
+    if (stop) { break; }
+    /* woken by pl_mqtt_connect, which already reconnected */
+    if (idled) { continue; }
+
+    fprintf(stderr, "pl_mqtt: network loop ended%s%s%s, reconnecting to %s:%d in %ds\n",
+            rc ? " (" : "", rc ? pl_mqtt_strerror(rc) : "", rc ? ")" : "",
+            c->conf->host, c->conf->port, delay);
+
+    struct timespec ts;
+    deadline_in(&ts, delay * 1000);
+    pthread_mutex_lock(&c->lock);
+    while (!c->stopping && c->want_connected) {
+      if (pthread_cond_timedwait(&c->cond, &c->lock, &ts) != 0) { break; }
+    }
+    stop = c->stopping;
+    int want = c->want_connected;
+    pthread_mutex_unlock(&c->lock);
+    if (stop) { break; }
+    if (!want) { continue; }
+
+    delay = (delay * 2 > RECONNECT_DELAY_MAX) ? RECONNECT_DELAY_MAX : delay * 2;
+    rc = mosquitto_reconnect(c->mosq);
+    if (rc != MOSQ_ERR_SUCCESS) {
+      /* the next mosquitto_loop_forever returns at once or retries by itself */
+      fprintf(stderr, "pl_mqtt: reconnect to %s:%d failed (%s)\n",
+              c->conf->host, c->conf->port, pl_mqtt_strerror(rc));
+    }
+  }
+  return NULL;
+}
+
 pl_mqtt_client *pl_mqtt_client_new(const pl_mqtt_conf *conf, char *errstr, size_t errstr_size)
 {
   pthread_once(&lib_once, lib_init);
@@ -366,6 +441,11 @@ pl_mqtt_client *pl_mqtt_client_new(const pl_mqtt_conf *conf, char *errstr, size_
   if (!c->mosq) { seterr(errstr, errstr_size, "mosquitto_new failed"); goto fail; }
 
   int rc;
+  /* the network thread is our own (network_thread), not mosquitto_loop_start */
+  rc = mosquitto_threaded_set(c->mosq, true);
+  if (rc != MOSQ_ERR_SUCCESS) { seterr(errstr, errstr_size, mosquitto_strerror(rc)); goto fail; }
+  rc = mosquitto_reconnect_delay_set(c->mosq, RECONNECT_DELAY_MIN, LOOP_RECONNECT_DELAY_MAX, true);
+  if (rc != MOSQ_ERR_SUCCESS) { seterr(errstr, errstr_size, mosquitto_strerror(rc)); goto fail; }
   if (cf->protocol_version != 4) {
     rc = mosquitto_int_option(c->mosq, MOSQ_OPT_PROTOCOL_VERSION,
                               cf->protocol_version == 3 ? MQTT_PROTOCOL_V31 : MQTT_PROTOCOL_V5);
@@ -408,6 +488,7 @@ int pl_mqtt_connect(pl_mqtt_client *c, int timeout_ms)
   int first = !c->connect_called;
   c->connect_called = 1;
   c->connack_rc = -1;
+  c->want_connected = 1;
   pthread_mutex_unlock(&c->lock);
 
   /* do not hold the lock: callbacks may run as soon as the thread starts */
@@ -421,14 +502,15 @@ int pl_mqtt_connect(pl_mqtt_client *c, int timeout_ms)
   pthread_mutex_lock(&c->lock);
   int need_start = !c->started;
   c->started = 1;
+  /* wakes an idle network thread after pl_mqtt_disconnect */
+  pthread_cond_broadcast(&c->cond);
   pthread_mutex_unlock(&c->lock);
   if (need_start) {
-    rc = mosquitto_loop_start(c->mosq);
-    if (rc != MOSQ_ERR_SUCCESS) {
+    if (pthread_create(&c->thread, NULL, network_thread, c) != 0) {
       pthread_mutex_lock(&c->lock);
       c->started = 0;
       pthread_mutex_unlock(&c->lock);
-      return rc;
+      return MOSQ_ERR_ERRNO;
     }
   }
 
@@ -455,6 +537,9 @@ int pl_mqtt_is_connected(pl_mqtt_client *c)
 int pl_mqtt_disconnect(pl_mqtt_client *c)
 {
   if (!c) { return PL_MQTT_EARG; }
+  pthread_mutex_lock(&c->lock);
+  c->want_connected = 0;
+  pthread_mutex_unlock(&c->lock);
   int rc = mosquitto_disconnect(c->mosq);
   return rc;
 }
@@ -464,8 +549,15 @@ void pl_mqtt_client_destroy(pl_mqtt_client *c)
   if (!c) { return; }
   if (c->mosq) {
     if (c->started) {
+      pthread_mutex_lock(&c->lock);
+      c->stopping = 1;
+      c->want_connected = 0;
+      pthread_cond_broadcast(&c->cond);
+      pthread_mutex_unlock(&c->lock);
+      /* ends mosquitto_loop_forever, possibly only after a pending
+       * reconnect delay (at most LOOP_RECONNECT_DELAY_MAX seconds) */
       mosquitto_disconnect(c->mosq);
-      mosquitto_loop_stop(c->mosq, false);   /* joins the network thread */
+      pthread_join(c->thread, NULL);
     }
     mosquitto_destroy(c->mosq);
   }

@@ -5,8 +5,12 @@ Prolog bindings for [libmosquitto](https://mosquitto.org/), in the same layout a
 one Prolog-neutral C core (`src/mqtt_core.[ch]`), a thin SWI-Prolog bridge (`src/swi-mqtt-c.c`),
 a thin GNU Prolog bridge (`src/gp-mqtt-c.c`, `src/gp-mqtt.pl`) and a shared Prolog layer (`src/mqtt.pl`).
 
-Each client runs libmosquitto's network thread (automatic reconnect included). Incoming messages
-are queued and fetched with `mqtt_poll/4`; subscriptions are renewed after a reconnect.
+Each client runs a network thread around libmosquitto's `mosquitto_loop_forever`. It reconnects
+after any lost connection, also after the errors that make libmosquitto give up (a broken TLS
+stream, a failed DNS lookup): the loop is restarted with a backoff of 1s doubling up to 60s,
+until `mqtt_disconnect/1` or `mqtt_destroy/1`. Lost connections and reconnects are logged to
+stderr. Incoming messages are queued and fetched with `mqtt_poll/4`; subscriptions are renewed
+after a reconnect.
 
 ## compilation
 

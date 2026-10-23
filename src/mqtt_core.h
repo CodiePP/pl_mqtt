@@ -22,9 +22,11 @@
  * SWI-Prolog bridges. this file has no dependency on either Prolog C
  * interface.
  *
- * a client runs libmosquitto's network thread (mosquitto_loop_start);
- * incoming messages are copied onto a queue that the Prolog side drains
- * with pl_mqtt_poll. */
+ * a client runs its own network thread around mosquitto_loop_forever,
+ * restarted with a backoff whenever libmosquitto gives up on a connection,
+ * so it keeps reconnecting until pl_mqtt_disconnect or
+ * pl_mqtt_client_destroy. incoming messages are copied onto a queue that
+ * the Prolog side drains with pl_mqtt_poll. */
 
 #include <stdint.h>
 #include <stddef.h>
